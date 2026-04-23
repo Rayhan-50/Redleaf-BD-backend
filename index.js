@@ -4,6 +4,9 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const NodeCache = require('node-cache');
+const appCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 require('dotenv').config();
 let stripe;
 if (process.env.STRIPE_SECRET_KEY) {
@@ -29,6 +32,9 @@ const corsOptions = {
     'http://localhost:5173',
     'http://localhost:5174',
     'https://redleaf-bd.vercel.app',
+    'https://redleafbd-8a215.web.app',
+    'https://redleafbd-8a215.firebaseapp.com',
+    'https://redleaf-bd-frontend-i83q.vercel.app',
     process.env.CLIENT_ADDRESS,
     process.env.DEV_CLIENT,
   ].filter(Boolean),
@@ -40,15 +46,38 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(helmet({ crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' } }));
 
-// Rate limiting
-const limiter = rateLimit({
+// ─── Tiered Rate Limiting ─────────────────────────────────────────────────────
+// Public product browsing — generous limit (cached anyway, near-zero DB cost)
+const publicLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: 2000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many requests, please try again later.' },
 });
-app.use(limiter);
+// Auth endpoints — strict (prevents brute-force login attacks)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many auth attempts, please wait.' },
+});
+// Protected API (orders, cart, payments) — moderate
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' },
+});
+
+app.use('/products', publicLimiter);   // public: 2000 req / 15 min
+app.use('/jwt',      authLimiter);     // auth:   20 req / 15 min (brute-force guard)
+app.use('/login',    authLimiter);
+app.use(apiLimiter);                   // everything else: 500 req / 15 min
+app.use(compression({ level: 6, threshold: 1024 }));
+
 
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
@@ -109,6 +138,20 @@ async function run() {
     const cartCollection = db.collection('carts');
     const orderCollection = db.collection('orders');
     const paymentCollection = db.collection('payments');
+    const blogCollection = db.collection('blogs');
+
+    // Create indexes for O(log n) query performance
+    await Promise.all([
+      productCollection.createIndex({ category: 1 }),
+      productCollection.createIndex({ price: 1 }),
+      productCollection.createIndex({ sold: -1 }),
+      productCollection.createIndex({ createdAt: -1 }),
+      orderCollection.createIndex({ email: 1 }),
+      orderCollection.createIndex({ status: 1 }),
+      orderCollection.createIndex({ orderedAt: -1 }),
+      paymentCollection.createIndex({ createdAt: -1 }),
+    ]).catch(err => console.warn('Index warning:', err.message));
+    console.log('✅ DB indexes ensured.');
 
     // ── Auth Middleware ───────────────────────────────────────────────────────
     const verifyToken = (req, res, next) => {
@@ -137,7 +180,7 @@ async function run() {
     // ═══════════════════════════════════════════════════════════════════════════
     app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const { search, role } = req.query;
+        const { search, role, page = 1, limit = 10, sort = 'name', order = 'asc' } = req.query;
         let query = {};
         if (search) {
           query.$or = [
@@ -146,8 +189,15 @@ async function run() {
           ];
         }
         if (role && role !== 'all') query.role = role;
-        const result = await userCollection.find(query).toArray();
-        res.send(result);
+
+        const sortObj = { [sort]: order === 'desc' ? -1 : 1 };
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const [users, total] = await Promise.all([
+          userCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray(),
+          userCollection.countDocuments(query),
+        ]);
+        res.send({ users, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) });
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch users' });
       }
@@ -204,6 +254,15 @@ async function run() {
     app.get('/products', async (req, res) => {
       try {
         const { category, search, sort, page = 1, limit = 20 } = req.query;
+
+        // HTTP cache: CDN + browser can cache product lists 5 min
+        res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+
+        // In-memory cache key
+        const cacheKey = `products:${category}:${search}:${sort}:${page}:${limit}`;
+        const cached = appCache.get(cacheKey);
+        if (cached) return res.send(cached);
+
         let query = {};
         if (category && category !== 'all') query.category = category;
         if (search) {
@@ -217,12 +276,16 @@ async function run() {
         if (sort === 'price_desc') sortObj = { price: -1 };
         if (sort === 'popular') sortObj = { sold: -1 };
 
+        // Projection: only fields needed for product cards
+        const projection = { title: 1, price: 1, image: 1, category: 1, unit: 1, sold: 1, createdAt: 1 };
         const skip = (parseInt(page) - 1) * parseInt(limit);
         const [products, total] = await Promise.all([
-          productCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray(),
+          productCollection.find(query, { projection }).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray(),
           productCollection.countDocuments(query),
         ]);
-        res.send({ products, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) });
+        const payload = { products, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) };
+        appCache.set(cacheKey, payload);
+        res.send(payload);
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch products' });
       }
@@ -240,12 +303,9 @@ async function run() {
 
     app.post('/products', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const product = {
-          ...req.body,
-          sold: 0,
-          createdAt: new Date(),
-        };
+        const product = { ...req.body, sold: 0, createdAt: new Date() };
         const result = await productCollection.insertOne(product);
+        appCache.flushAll(); // Invalidate all product caches on write
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to create product' });
@@ -258,6 +318,7 @@ async function run() {
           { _id: new ObjectId(req.params.id) },
           { $set: { ...req.body, updatedAt: new Date() } }
         );
+        appCache.flushAll();
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to update product' });
@@ -267,6 +328,7 @@ async function run() {
     app.delete('/products/:id', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const result = await productCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        appCache.flushAll();
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to delete product' });
@@ -353,8 +415,11 @@ async function run() {
     // ═══════════════════════════════════════════════════════════════════════════
     app.post('/orders', verifyToken, async (req, res) => {
       try {
+        // Generate human readable Order ID
+        const orderIdString = `RLBD-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
         const order = {
           ...req.body,
+          orderIdString,
           status: 'pending',
           orderedAt: new Date(),
         };
@@ -417,18 +482,61 @@ async function run() {
       }
     });
 
+    app.delete('/orders/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await orderCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).send({ message: 'Order not found' });
+        res.send({ message: 'Order deleted successfully' });
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to delete order' });
+      }
+    });
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  PAYMENTS
     // ═══════════════════════════════════════════════════════════════════════════
     app.post('/payments', verifyToken, async (req, res) => {
       try {
-        const payment = { ...req.body, paidAt: new Date() };
+        const { paymentMethod, transactionId } = req.body;
+
+        // Prevent duplicate TxID for bkash_manual
+        if (paymentMethod === 'bkash_manual' && transactionId) {
+          const existingTx = await paymentCollection.findOne({ transactionId });
+          if (existingTx) {
+            return res.status(400).send({ message: 'Transaction ID already exists. Duplicate transaction detected.' });
+          }
+        }
+
+        const payment = {
+          ...req.body,
+          createdAt: new Date(),
+        };
+
+        // Determine initial status based on payment method
+        let orderStatus = 'pending';
+        let paymentStatus = 'pending';
+
+        if (paymentMethod === 'card') {
+          paymentStatus = 'paid';
+          orderStatus = 'processing';
+          payment.paidAt = new Date();
+        } else if (paymentMethod === 'bkash_manual') {
+          paymentStatus = 'under_review';
+          orderStatus = 'pending';
+        } else if (paymentMethod === 'cod') {
+          paymentStatus = 'pending';
+          orderStatus = 'pending';
+        }
+
+        payment.status = paymentStatus;
+
         const result = await paymentCollection.insertOne(payment);
-        // Update order status to processing after payment
+
+        // Update order status
         if (payment.orderId) {
           await orderCollection.updateOne(
             { _id: new ObjectId(payment.orderId) },
-            { $set: { status: 'processing', paidAt: new Date() } }
+            { $set: { status: orderStatus, paymentStatus: paymentStatus } }
           );
         }
         res.send(result);
@@ -437,18 +545,67 @@ async function run() {
       }
     });
 
+    app.patch('/payments/:id/verify', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const paymentId = req.params.id;
+        const payment = await paymentCollection.findOne({ _id: new ObjectId(paymentId) });
+        if (!payment) return res.status(404).send({ message: 'Payment not found' });
+
+        const result = await paymentCollection.updateOne(
+          { _id: new ObjectId(paymentId) },
+          { $set: { status: 'paid', paidAt: new Date(), verifiedBy: req.decoded.email } }
+        );
+
+        if (payment.orderId) {
+          await orderCollection.updateOne(
+            { _id: new ObjectId(payment.orderId) },
+            { $set: { status: 'processing', paymentStatus: 'paid' } }
+          );
+        }
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to verify payment' });
+      }
+    });
+
+    app.patch('/payments/:id/reject', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const paymentId = req.params.id;
+        const payment = await paymentCollection.findOne({ _id: new ObjectId(paymentId) });
+        if (!payment) return res.status(404).send({ message: 'Payment not found' });
+
+        const result = await paymentCollection.updateOne(
+          { _id: new ObjectId(paymentId) },
+          { $set: { status: 'rejected', rejectedAt: new Date(), rejectedBy: req.decoded.email } }
+        );
+
+        if (payment.orderId) {
+          await orderCollection.updateOne(
+            { _id: new ObjectId(payment.orderId) },
+            { $set: { status: 'cancelled', paymentStatus: 'rejected' } }
+          );
+        }
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to reject payment' });
+      }
+    });
+
     app.get('/payments', verifyToken, async (req, res) => {
       try {
         const { email } = req.query;
         const user = await userCollection.findOne({ email: req.decoded.email });
         if (user?.role === 'admin') {
-          const payments = await paymentCollection.find({}).sort({ paidAt: -1 }).toArray();
+          // Sort by createdAt descending; paidAt may be absent for manual/COD payments
+          const payments = await paymentCollection.find({}).sort({ createdAt: -1 }).toArray();
           return res.send(payments);
         }
         if (req.decoded.email !== email) {
           return res.status(403).send({ message: 'forbidden access' });
         }
-        const payments = await paymentCollection.find({ email }).sort({ paidAt: -1 }).toArray();
+        const payments = await paymentCollection.find({ email }).sort({ createdAt: -1 }).toArray();
         res.send(payments);
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch payments' });
@@ -631,6 +788,68 @@ async function run() {
         res.status(500).send({ message: 'Failed to delete contact' });
       }
     });
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BLOGS
+    // ═══════════════════════════════════════════════════════════════════════════
+    app.post('/blogs', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const blog = {
+          ...req.body,
+          views: 0,
+          comments: 0,
+          createdAt: new Date(),
+        };
+        const result = await blogCollection.insertOne(blog);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to create blog post' });
+      }
+    });
+
+    app.get('/blogs', async (req, res) => {
+      try {
+        const blogs = await blogCollection.find().sort({ createdAt: -1 }).toArray();
+        res.send(blogs);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to fetch blogs' });
+      }
+    });
+
+    app.put('/blogs/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { _id, ...updatedData } = req.body;
+        const result = await blogCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: updatedData }
+        );
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to update blog post' });
+      }
+    });
+
+    app.delete('/blogs/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await blogCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to delete blog post' });
+      }
+    });
+
+    // Auto-cancel unpaid orders after 30 minutes
+    setInterval(async () => {
+      try {
+        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+        await orderCollection.updateMany(
+          { status: 'pending', paymentStatus: { $exists: false }, orderedAt: { $lt: thirtyMinutesAgo } },
+          { $set: { status: 'cancelled', autoCancelledAt: new Date() } }
+        );
+      } catch (err) {
+        console.error("Failed to auto-cancel orders", err);
+      }
+    }, 15 * 60 * 1000); // Check every 15 mins
 
   } catch (error) {
     console.error('MongoDB connection error:', error);
