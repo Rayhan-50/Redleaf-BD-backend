@@ -295,11 +295,9 @@ async function run() {
         if (sort === 'price_desc') sortObj = { price: -1 };
         if (sort === 'popular') sortObj = { sold: -1 };
 
-        // Projection: only fields needed for product cards
-        const projection = { title: 1, price: 1, image: 1, category: 1, unit: 1, sold: 1, createdAt: 1 };
         const skip = (parseInt(page) - 1) * parseInt(limit);
         const [products, total] = await Promise.all([
-          productCollection.find(query, { projection }).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray(),
+          productCollection.find(query).sort(sortObj).skip(skip).limit(parseInt(limit)).toArray(),
           productCollection.countDocuments(query),
         ]);
         const payload = { products, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) };
