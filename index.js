@@ -91,6 +91,25 @@ const client = new MongoClient(uri, {
   },
 });
 
+// ─── Cold-start ready gate ────────────────────────────────────────────────────
+// run() registers routes asynchronously. On Vercel cold starts, requests can
+// arrive before run() finishes → 404. This gate makes every request wait until
+// run() has completed route registration.
+let _resolveReady;
+const dbReadyPromise = new Promise((resolve) => { _resolveReady = resolve; });
+let dbReady = false;
+
+app.use(async (req, res, next) => {
+  // Let the root health-check through immediately
+  if (req.path === '/') return next();
+  // JWT and user-registration are already outside run(), let them through
+  if (req.path === '/jwt' || (req.path === '/users' && req.method === 'POST')) return next();
+  if (!dbReady) {
+    try { await dbReadyPromise; } catch { return res.status(503).send({ message: 'Server is starting, please retry.' }); }
+  }
+  next();
+});
+
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 app.post('/jwt', async (req, res) => {
   try {
@@ -838,6 +857,11 @@ async function run() {
       }
     });
 
+    // Signal that all routes are registered and DB is ready
+    dbReady = true;
+    _resolveReady();
+    console.log('✅ All routes registered. Server ready.');
+
     // Auto-cancel unpaid orders after 30 minutes
     setInterval(async () => {
       try {
@@ -853,6 +877,8 @@ async function run() {
 
   } catch (error) {
     console.error('MongoDB connection error:', error);
+    // Resolve the gate even on error so requests get a proper error instead of hanging
+    _resolveReady();
   }
 }
 
