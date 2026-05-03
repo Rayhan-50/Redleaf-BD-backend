@@ -6,8 +6,23 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const NodeCache = require('node-cache');
+const winston = require('winston');
+const morgan = require('morgan');
 const appCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 require('dotenv').config();
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ]
+});
 let stripe;
 if (process.env.STRIPE_SECRET_KEY) {
   stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -45,6 +60,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(helmet({ crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' } }));
+app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
 
 // ─── Tiered Rate Limiting ─────────────────────────────────────────────────────
 // Public product browsing — generous limit (cached anyway, near-zero DB cost)
@@ -73,8 +89,8 @@ const apiLimiter = rateLimit({
 });
 
 app.use('/products', publicLimiter);   // public: 2000 req / 15 min
-app.use('/jwt',      authLimiter);     // auth:   20 req / 15 min (brute-force guard)
-app.use('/login',    authLimiter);
+app.use('/jwt', authLimiter);     // auth:   20 req / 15 min (brute-force guard)
+app.use('/login', authLimiter);
 app.use(apiLimiter);                   // everything else: 500 req / 15 min
 app.use(compression({ level: 6, threshold: 1024 }));
 
@@ -158,6 +174,7 @@ async function run() {
     const orderCollection = db.collection('orders');
     const paymentCollection = db.collection('payments');
     const blogCollection = db.collection('blogs');
+    const settingsCollection = db.collection('settings');
 
     // Create indexes for O(log n) query performance
     await Promise.all([
@@ -428,15 +445,74 @@ async function run() {
     });
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  SETTINGS
+    // ═══════════════════════════════════════════════════════════════════════════
+    app.get('/settings/delivery', async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({ type: 'delivery' });
+        if (!settings) {
+          return res.send({ dhaka: 80, outside: 120 });
+        }
+        res.send({ dhaka: settings.dhaka, outside: settings.outside });
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to fetch delivery settings' });
+      }
+    });
+
+    app.put('/settings/delivery', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { dhaka, outside } = req.body;
+        const result = await settingsCollection.updateOne(
+          { type: 'delivery' },
+          { $set: { dhaka: parseInt(dhaka), outside: parseInt(outside), updatedAt: new Date() } },
+          { upsert: true }
+        );
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to update delivery settings' });
+      }
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  ORDERS
     // ═══════════════════════════════════════════════════════════════════════════
     app.post('/orders', verifyToken, async (req, res) => {
       try {
+        // Fetch current delivery settings
+        let dhakaCharge = 80;
+        let outsideCharge = 120;
+        const settings = await settingsCollection.findOne({ type: 'delivery' });
+        if (settings) {
+          dhakaCharge = settings.dhaka;
+          outsideCharge = settings.outside;
+        }
+
+        const { deliveryLocation, items } = req.body;
+        
+        // Calculate subtotal from items to be secure
+        let subtotal = 0;
+        if (items && items.length > 0) {
+          subtotal = items.reduce((sum, item) => sum + (item.price || 0) * (item.quantity || 1), 0);
+        }
+
+        const isDhakaLocation = deliveryLocation === 'Dhaka' || deliveryLocation === 'Dhaka City';
+        const cityStr = (req.body.city || '').toLowerCase();
+        const addressStr = (req.body.deliveryAddress || '').toLowerCase();
+        const isDhakaCity = cityStr.includes('dhaka');
+        const isDhakaAddress = addressStr.includes('dhaka');
+        
+        const isDhaka = isDhakaLocation || isDhakaCity || isDhakaAddress;
+        
+        const deliveryCharge = isDhaka ? dhakaCharge : outsideCharge;
+        const totalAmount = subtotal + deliveryCharge;
+
         // Generate human readable Order ID
         const orderIdString = `RLBD-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
         const order = {
           ...req.body,
           orderIdString,
+          deliveryCharge,
+          totalAmount,
           status: 'pending',
           orderedAt: new Date(),
         };
