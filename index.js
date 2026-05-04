@@ -306,15 +306,11 @@ async function run() {
       try {
         const { category, search, sort, page = 1, limit = 20 } = req.query;
 
-        // no-cache: browser always revalidates with the server.
-        // The server-side NodeCache (30s) still avoids hitting MongoDB on every request.
-        // DO NOT use max-age here — it causes browser to serve stale data after admin edits.
-        res.set('Cache-Control', 'no-cache');
-
-        // In-memory cache key
-        const cacheKey = `products:${category}:${search}:${sort}:${page}:${limit}`;
-        const cached = appCache.get(cacheKey);
-        if (cached) return res.send(cached);
+        // completely disable caching
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+        res.set('Surrogate-Control', 'no-store');
 
         let query = {};
         if (category && category !== 'all') query.category = category;
@@ -335,7 +331,6 @@ async function run() {
           productCollection.countDocuments(query),
         ]);
         const payload = { products, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) };
-        appCache.set(cacheKey, payload);
         res.send(payload);
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch products' });
@@ -344,6 +339,11 @@ async function run() {
 
     app.get('/products/:id', async (req, res) => {
       try {
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+        res.set('Surrogate-Control', 'no-store');
+
         const product = await productCollection.findOne({ _id: new ObjectId(req.params.id) });
         if (!product) return res.status(404).send({ message: 'Product not found' });
         res.send(product);
