@@ -306,8 +306,10 @@ async function run() {
       try {
         const { category, search, sort, page = 1, limit = 20 } = req.query;
 
-        // HTTP cache: CDN + browser can cache product lists 5 min
-        res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+        // no-cache: browser always revalidates with the server.
+        // The server-side NodeCache (30s) still avoids hitting MongoDB on every request.
+        // DO NOT use max-age here — it causes browser to serve stale data after admin edits.
+        res.set('Cache-Control', 'no-cache');
 
         // In-memory cache key
         const cacheKey = `products:${category}:${search}:${sort}:${page}:${limit}`;
