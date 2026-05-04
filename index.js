@@ -8,7 +8,8 @@ const compression = require('compression');
 const NodeCache = require('node-cache');
 const winston = require('winston');
 const morgan = require('morgan');
-const appCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+const { computeDelivery, computeSubtotal, validateZoneTiers, DEFAULT_ZONES } = require('./deliveryEngine');
+const appCache = new NodeCache({ stdTTL: 30, checkperiod: 10 }); // 30s TTL — short enough that admin changes appear quickly
 require('dotenv').config();
 
 const logger = winston.createLogger({
@@ -27,16 +28,16 @@ let stripe;
 if (process.env.STRIPE_SECRET_KEY) {
   stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 } else {
-  console.warn("STRIPE_SECRET_KEY is missing in environment variables.");
+  logger.warn('STRIPE_SECRET_KEY is missing in environment variables.');
 }
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
+  logger.error('Uncaught Exception:', { error: err.message, stack: err.stack });
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('Unhandled Rejection', { reason: String(reason) });
 });
 
 const port = process.env.PORT || 5000;
@@ -50,6 +51,8 @@ const corsOptions = {
     'https://redleafbd-8a215.web.app',
     'https://redleafbd-8a215.firebaseapp.com',
     'https://redleaf-bd-frontend-i83q.vercel.app',
+    'https://redleaf-bd.com',
+    'https://www.redleaf-bd.com',
     process.env.CLIENT_ADDRESS,
     process.env.DEV_CLIENT,
   ].filter(Boolean),
@@ -57,8 +60,9 @@ const corsOptions = {
   credentials: true,
 };
 
+app.set('trust proxy', 1); // Correct IP detection behind Vercel / reverse proxy
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 app.use(helmet({ crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' } }));
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
 
@@ -175,19 +179,30 @@ async function run() {
     const paymentCollection = db.collection('payments');
     const blogCollection = db.collection('blogs');
     const settingsCollection = db.collection('settings');
+    const featuredCollection = db.collection('featuredProducts');
 
     // Create indexes for O(log n) query performance
     await Promise.all([
+      // Products
       productCollection.createIndex({ category: 1 }),
       productCollection.createIndex({ price: 1 }),
       productCollection.createIndex({ sold: -1 }),
       productCollection.createIndex({ createdAt: -1 }),
+      // Orders
       orderCollection.createIndex({ email: 1 }),
       orderCollection.createIndex({ status: 1 }),
       orderCollection.createIndex({ orderedAt: -1 }),
+      // Payments
       paymentCollection.createIndex({ createdAt: -1 }),
-    ]).catch(err => console.warn('Index warning:', err.message));
-    console.log('✅ DB indexes ensured.');
+      paymentCollection.createIndex({ transactionId: 1 }, { sparse: true }),
+      paymentCollection.createIndex({ orderId: 1 }),
+      // Users / Profiles / Carts
+      userCollection.createIndex({ email: 1 }, { unique: true }),
+      cartCollection.createIndex({ email: 1 }),
+      featuredCollection.createIndex({ productId: 1 }, { unique: true }),
+      featuredCollection.createIndex({ addedAt: -1 }),
+    ]).catch(err => logger.warn('Index warning:', { message: err.message }));
+    logger.info('✅ DB indexes ensured.');
 
     // ── Auth Middleware ───────────────────────────────────────────────────────
     const verifyToken = (req, res, next) => {
@@ -337,7 +352,13 @@ async function run() {
 
     app.post('/products', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const product = { ...req.body, sold: 0, createdAt: new Date() };
+        const product = {
+          ...req.body,
+          sold: 0,
+          createdAt: new Date(),
+          free_delivery_enabled: req.body.free_delivery_enabled === true,
+          free_delivery_min_amount: Number(req.body.free_delivery_min_amount) || 0,
+        };
         const result = await productCollection.insertOne(product);
         appCache.flushAll(); // Invalidate all product caches on write
         res.send(result);
@@ -348,14 +369,51 @@ async function run() {
 
     app.put('/products/:id', verifyToken, verifyAdmin, async (req, res) => {
       try {
+        const updatePayload = {
+          ...req.body,
+          updatedAt: new Date(),
+          free_delivery_enabled: req.body.free_delivery_enabled === true,
+          free_delivery_min_amount: Number(req.body.free_delivery_min_amount) || 0,
+        };
         const result = await productCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
-          { $set: { ...req.body, updatedAt: new Date() } }
+          { $set: updatePayload }
         );
         appCache.flushAll();
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to update product' });
+      }
+    });
+
+    // ── Admin: update only delivery settings for a product (instant, no redeploy) ──
+    app.patch('/products/:id/delivery-settings', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { free_delivery_enabled, free_delivery_min_amount } = req.body;
+        if (typeof free_delivery_enabled !== 'boolean') {
+          return res.status(400).send({ message: 'free_delivery_enabled must be a boolean' });
+        }
+        const result = await productCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          {
+            $set: {
+              free_delivery_enabled,
+              free_delivery_min_amount: Number(free_delivery_min_amount) || 0,
+              updatedAt: new Date(),
+            },
+          }
+        );
+        appCache.flushAll(); // Force cache refresh so next preview sees the new rule
+        logger.info('Product delivery settings updated', {
+          productId: req.params.id,
+          free_delivery_enabled,
+          free_delivery_min_amount,
+          by: req.decoded.email,
+        });
+        res.send(result);
+      } catch (error) {
+        logger.error('Failed to update product delivery settings', { error: error.message });
+        res.status(500).send({ message: 'Failed to update product delivery settings' });
       }
     });
 
@@ -366,6 +424,60 @@ async function run() {
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to delete product' });
+      }
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  DELIVERY PREVIEW (live delivery charge calculation for cart/checkout)
+    // ═══════════════════════════════════════════════════════════════════════════
+    app.post('/delivery/preview', verifyToken, async (req, res) => {
+      try {
+        const { cartItems = [], deliveryLocation = '', city = '', address = '' } = req.body;
+
+        if (!Array.isArray(cartItems) || cartItems.length === 0) {
+          return res.send({ charge: 0, isFree: false, reason: null, resolvedZone: '', hints: [] });
+        }
+
+        // Use shared helper — reads from cache or DB
+        const deliverySettings = await loadDeliverySettings();
+        const zoneTiers = deliverySettings.zones || DEFAULT_ZONES;
+
+        // Fetch fresh product data (prevents stale free_delivery fields from client)
+        const productIds = cartItems
+          .map(i => { try { return new ObjectId(i.productId || i._id); } catch { return null; } })
+          .filter(Boolean);
+
+        const freshProducts = productIds.length > 0
+          ? await productCollection.find({ _id: { $in: productIds } }).toArray()
+          : [];
+
+        const productMap = {};
+        freshProducts.forEach(p => { productMap[p._id.toString()] = p; });
+
+        const enrichedItems = cartItems.map(item => {
+          const pid = (item.productId || item._id || '').toString();
+          const fresh = productMap[pid] || {};
+          return {
+            ...item,
+            free_delivery_enabled: fresh.free_delivery_enabled ?? false,
+            free_delivery_min_amount: fresh.free_delivery_min_amount ?? 0,
+            title: fresh.title || item.title || '',
+            price: fresh.price ?? item.price ?? 0,  // DB price takes priority (tamper-proof)
+          };
+        });
+
+        const result = computeDelivery({
+          cartItems: enrichedItems,
+          zoneTiers,
+          deliveryLocation,
+          city,
+          address,
+        });
+
+        res.send(result);
+      } catch (error) {
+        logger.error('Delivery preview failed', { error: error.message });
+        res.status(500).send({ message: 'Failed to compute delivery preview' });
       }
     });
 
@@ -445,15 +557,20 @@ async function run() {
     });
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  SETTINGS
+    //  SETTINGS — Tiered Zone Delivery
     // ═══════════════════════════════════════════════════════════════════════════
+
+    // Helper to load zone tiers — always reads from DB for delivery settings
+    // (document is tiny; no benefit to caching it and risking stale admin changes)
+    async function loadDeliverySettings() {
+      const settings = await settingsCollection.findOne({ type: 'delivery' });
+      return { zones: (settings && settings.zones) ? settings.zones : DEFAULT_ZONES };
+    }
+
     app.get('/settings/delivery', async (req, res) => {
       try {
-        const settings = await settingsCollection.findOne({ type: 'delivery' });
-        if (!settings) {
-          return res.send({ dhaka: 80, outside: 120 });
-        }
-        res.send({ dhaka: settings.dhaka, outside: settings.outside });
+        const payload = await loadDeliverySettings();
+        res.send(payload);
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch delivery settings' });
       }
@@ -461,12 +578,18 @@ async function run() {
 
     app.put('/settings/delivery', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const { dhaka, outside } = req.body;
+        const { zones } = req.body;
+        const validation = validateZoneTiers(zones);
+        if (!validation.valid) {
+          return res.status(400).send({ message: validation.error });
+        }
         const result = await settingsCollection.updateOne(
           { type: 'delivery' },
-          { $set: { dhaka: parseInt(dhaka), outside: parseInt(outside), updatedAt: new Date() } },
+          { $set: { zones, updatedAt: new Date() } },
           { upsert: true }
         );
+        appCache.flushAll(); // Clear any lingering product-list caches when zone pricing changes
+        logger.info('Delivery zone settings updated', { zoneCount: Object.keys(zones).length, by: req.decoded.email });
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to update delivery settings' });
@@ -478,49 +601,95 @@ async function run() {
     // ═══════════════════════════════════════════════════════════════════════════
     app.post('/orders', verifyToken, async (req, res) => {
       try {
-        // Fetch current delivery settings
-        let dhakaCharge = 80;
-        let outsideCharge = 120;
-        const settings = await settingsCollection.findOne({ type: 'delivery' });
-        if (settings) {
-          dhakaCharge = settings.dhaka;
-          outsideCharge = settings.outside;
+        // ── Input validation ─────────────────────────────────────────────────
+        const { deliveryLocation, items, customerName, phone, address } = req.body;
+        if (!items || items.length === 0) {
+          return res.status(400).send({ message: 'Order must contain at least one item.' });
+        }
+        if (!customerName || !phone || !address) {
+          return res.status(400).send({ message: 'Name, phone, and address are required.' });
         }
 
-        const { deliveryLocation, items } = req.body;
-        
-        // Calculate subtotal from items to be secure
-        let subtotal = 0;
-        if (items && items.length > 0) {
-          subtotal = items.reduce((sum, item) => sum + (item.price || 0) * (item.quantity || 1), 0);
-        }
+        // ── Fetch fresh delivery settings (zone tiers) ──────────────────────
+        const deliverySettings = await loadDeliverySettings();
+        const zoneTiers = deliverySettings.zones || DEFAULT_ZONES;
 
-        const isDhakaLocation = deliveryLocation === 'Dhaka' || deliveryLocation === 'Dhaka City';
-        const cityStr = (req.body.city || '').toLowerCase();
-        const addressStr = (req.body.deliveryAddress || '').toLowerCase();
-        const isDhakaCity = cityStr.includes('dhaka');
-        const isDhakaAddress = addressStr.includes('dhaka');
-        
-        const isDhaka = isDhakaLocation || isDhakaCity || isDhakaAddress;
-        
-        const deliveryCharge = isDhaka ? dhakaCharge : outsideCharge;
+        // ── Fetch fresh product data to enrich cart items (tamper-proof) ─────
+        const productIds = items
+          .map(i => { try { return new ObjectId(i.productId || i._id); } catch { return null; } })
+          .filter(Boolean);
+
+        const freshProducts = productIds.length > 0
+          ? await productCollection.find({ _id: { $in: productIds } }).toArray()
+          : [];
+
+        const productMap = {};
+        freshProducts.forEach(p => { productMap[p._id.toString()] = p; });
+
+        const enrichedItems = items.map(item => {
+          const pid = (item.productId || item._id || '').toString();
+          const fresh = productMap[pid] || {};
+          return {
+            ...item,
+            price: fresh.price ?? item.price ?? 0,
+            free_delivery_enabled: fresh.free_delivery_enabled ?? false,
+            free_delivery_min_amount: fresh.free_delivery_min_amount ?? 0,
+            title: fresh.title || item.title || '',
+          };
+        });
+
+        // ── Server-side delivery computation (overrides any client-sent value) ──
+        const deliveryResult = computeDelivery({
+          cartItems: enrichedItems,
+          zoneTiers,
+          deliveryLocation: req.body.deliveryLocation || '',
+          city: req.body.city || '',
+          address: req.body.address || '',
+        });
+
+        const subtotal = computeSubtotal(enrichedItems);
+        const deliveryCharge = deliveryResult.charge;
         const totalAmount = subtotal + deliveryCharge;
 
-        // Generate human readable Order ID
+        // ── Generate human-readable Order ID ─────────────────────────────────
         const orderIdString = `RLBD-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+
+        // ── Build order document (whitelisted fields) ─────────────────────────
         const order = {
-          ...req.body,
+          email: req.decoded.email,  // always use JWT email — never trust client
+          customerName: req.body.customerName,
+          phone: req.body.phone,
+          altPhone: req.body.altPhone || '',
+          address: req.body.address,
+          deliveryAddress: req.body.deliveryAddress || req.body.address,
+          city: req.body.city,
+          notes: req.body.notes || '',
+          items,
+          deliveryLocation: req.body.deliveryLocation || '',
           orderIdString,
+          subtotal,
           deliveryCharge,
+          deliveryIsFree: deliveryResult.isFree,
+          deliveryFreeReason: deliveryResult.reason,
+          deliveryFreeProduct: deliveryResult.freeRuleProduct,
           totalAmount,
           status: 'pending',
           orderedAt: new Date(),
         };
+
         const result = await orderCollection.insertOne(order);
         // Clear the user's cart after placing order
         await cartCollection.deleteMany({ email: order.email });
+        logger.info('New order placed', {
+          orderId: orderIdString,
+          email: order.email,
+          totalAmount,
+          deliveryCharge,
+          deliveryFreeReason: deliveryResult.reason,
+        });
         res.send(result);
       } catch (error) {
+        logger.error('Failed to place order', { error: error.message });
         res.status(500).send({ message: 'Failed to place order' });
       }
     });
@@ -632,8 +801,10 @@ async function run() {
             { $set: { status: orderStatus, paymentStatus: paymentStatus } }
           );
         }
+        logger.info('Payment recorded', { method: paymentMethod, status: paymentStatus, email: req.body.email });
         res.send(result);
       } catch (error) {
+        logger.error('Failed to save payment', { error: error.message, email: req.body?.email });
         res.status(500).send({ message: 'Failed to save payment' });
       }
     });
@@ -714,7 +885,8 @@ async function run() {
         if (!price || isNaN(price)) {
           return res.status(400).send({ message: 'Invalid price' });
         }
-        const amount = parseInt(price * 100); // converting to cents
+        // BDT is a zero-decimal currency in Stripe — do NOT multiply by 100
+        const amount = Math.round(price); // send the raw taka amount
         const paymentIntent = await stripe.paymentIntents.create({
           amount: amount,
           currency: 'bdt',
@@ -840,6 +1012,83 @@ async function run() {
     });
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  FEATURED / MOST POPULAR PRODUCTS (admin-controlled)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GET — public, returns full product details for all featured items
+    app.get('/featured-products', async (req, res) => {
+      try {
+        const cacheKey = 'featured:products';
+        const cached = appCache.get(cacheKey);
+        if (cached) return res.send(cached);
+
+        const featuredDocs = await featuredCollection.find({}).sort({ addedAt: -1 }).toArray();
+        if (featuredDocs.length === 0) return res.send([]);
+
+        // Batch-fetch all product details in one query (no N+1)
+        const productIds = featuredDocs.map(f => new ObjectId(f.productId));
+        const products = await productCollection
+          .find({ _id: { $in: productIds } })
+          .toArray();
+
+        // Preserve the admin-defined order
+        const productMap = {};
+        products.forEach(p => { productMap[p._id.toString()] = p; });
+        const ordered = featuredDocs
+          .map(f => productMap[f.productId])
+          .filter(Boolean);
+
+        appCache.set(cacheKey, ordered, 120); // 2 min TTL
+        res.send(ordered);
+      } catch (error) {
+        logger.error('Failed to fetch featured products', { error: error.message });
+        res.status(500).send({ message: 'Failed to fetch featured products' });
+      }
+    });
+
+    // POST — admin adds a product to the featured list
+    app.post('/featured-products', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { productId } = req.body;
+        if (!productId) return res.status(400).send({ message: 'productId is required' });
+
+        // Validate product exists
+        const product = await productCollection.findOne({ _id: new ObjectId(productId) });
+        if (!product) return res.status(404).send({ message: 'Product not found' });
+
+        const existing = await featuredCollection.findOne({ productId });
+        if (existing) return res.status(409).send({ message: 'Product is already featured' });
+
+        const result = await featuredCollection.insertOne({
+          productId,
+          productTitle: product.title,
+          addedAt: new Date(),
+          addedBy: req.decoded.email,
+        });
+        appCache.del('featured:products');
+        logger.info('Product added to featured', { productId, by: req.decoded.email });
+        res.send(result);
+      } catch (error) {
+        logger.error('Failed to add featured product', { error: error.message });
+        res.status(500).send({ message: 'Failed to add featured product' });
+      }
+    });
+
+    // DELETE — admin removes a product from featured list
+    app.delete('/featured-products/:productId', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { productId } = req.params;
+        const result = await featuredCollection.deleteOne({ productId });
+        if (result.deletedCount === 0) return res.status(404).send({ message: 'Featured product not found' });
+        appCache.del('featured:products');
+        logger.info('Product removed from featured', { productId, by: req.decoded.email });
+        res.send({ message: 'Removed from featured successfully' });
+      } catch (error) {
+        logger.error('Failed to remove featured product', { error: error.message });
+        res.status(500).send({ message: 'Failed to remove featured product' });
+      }
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  CONTACT
     // ═══════════════════════════════════════════════════════════════════════════
     app.post('/contactCollection', async (req, res) => {
@@ -902,10 +1151,23 @@ async function run() {
 
     app.get('/blogs', async (req, res) => {
       try {
+        const cached = appCache.get('blogs:all');
+        if (cached) return res.send(cached);
         const blogs = await blogCollection.find().sort({ createdAt: -1 }).toArray();
+        appCache.set('blogs:all', blogs, 120); // 2 min TTL
         res.send(blogs);
       } catch (error) {
         res.status(500).send({ message: 'Failed to fetch blogs' });
+      }
+    });
+
+    app.delete('/blogs/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await blogCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        appCache.del('blogs:all');
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to delete blog post' });
       }
     });
 
@@ -916,25 +1178,17 @@ async function run() {
           { _id: new ObjectId(req.params.id) },
           { $set: updatedData }
         );
+        appCache.del('blogs:all');
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Failed to update blog post' });
       }
     });
 
-    app.delete('/blogs/:id', verifyToken, verifyAdmin, async (req, res) => {
-      try {
-        const result = await blogCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: 'Failed to delete blog post' });
-      }
-    });
-
     // Signal that all routes are registered and DB is ready
     dbReady = true;
     _resolveReady();
-    console.log('✅ All routes registered. Server ready.');
+    logger.info('✅ All routes registered. Server ready.');
 
     // Auto-cancel unpaid orders after 30 minutes
     setInterval(async () => {
@@ -965,7 +1219,7 @@ app.get('/', (req, res) => {
 
 // Global error handler
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  logger.error('Unhandled Express Error', { error: err.message, stack: err.stack, url: req.url });
   res.status(500).send({ message: 'Something went wrong!', error: err.message });
 });
 
